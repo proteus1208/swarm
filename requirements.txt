@@ -10,7 +10,7 @@ xmldiff==2.7.0
 filelock==3.25.2
 swarm-bullet3==2.0.0.1
 # Canonical SDK version for validator/miner environments.
-bittensor==10.2.0
+# bittensor==10.2.0
 msgpack==1.1.2
 importlib-metadata==9.0.0
 onnxruntime==1.23.2
@@ -19,7 +19,8 @@ wandb==0.25.1
 python-dotenv==1.2.2
 typing-extensions==4.15.0
 tqdm==4.67.3
-torch==2.10.0
+# torch==2.10.0
+torch>=2.5.1,<2.6
 gymnasium==0.29.1
 requests==2.32.5
 httpx==0.28.1
@@ -36,3 +37,4 @@ sqlalchemy==2.0.48
 python-multipart==0.0.22
 apscheduler==3.11.2
 psycopg2-binary==2.9.11
+pyqt5==5.15.10

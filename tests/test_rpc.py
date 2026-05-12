@@ -159,7 +159,7 @@ async def _run_episode(task: MapTask, uid: int, agent, gui=False):
 
         min_clearance = info.get("min_clearance", None)
         collision = info.get("collision", False)
-        score = flight_reward(
+        score, history = flight_reward(
             success=success,
             t=t_sim,
             horizon=task.horizon,

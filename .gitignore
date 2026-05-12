@@ -207,3 +207,7 @@ swarm_venv/
 
 # Accidental shell artifacts from malformed multiline CLI commands (repo root).
 /--*
+
+/ppo_logs/
+swarm/assets/maps
+swarm/submission_template

@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import math
 import os
+import io
+import queue
+import threading
 import numpy as np
 import gymnasium.spaces as spaces
 import pybullet as p
+import copy
 from PIL import Image
 
 from gym_pybullet_drones.envs.BaseRLAviary import BaseRLAviary
@@ -38,6 +42,375 @@ from swarm.constants import (
     SOLVER_ITERATIONS, SOLVER_MIN_ISLAND_SIZE,
 )
 
+def _moving_drone_path_monitor_main(
+    path_queue: "queue.Queue",
+    path_monitor_enabled: bool = False,
+) -> None:
+    if not path_monitor_enabled:
+        return
+
+    import sys
+    import io
+    import queue
+    import numpy as np
+
+    from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel
+    from PyQt5.QtCore import Qt, QTimer
+    from PyQt5.QtGui import QImage, QPixmap
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    argv = sys.argv if getattr(sys, "argv", None) else ["moving_drone"]
+    app = QApplication.instance() or QApplication(argv)
+
+    win = QMainWindow()
+    win.setWindowTitle("Drone path monitor")
+
+    central = QWidget()
+    win.setCentralWidget(central)
+
+    layout = QVBoxLayout()
+    central.setLayout(layout)
+
+    lbl_3d = QLabel()
+    lbl_xy = QLabel()
+    lbl_reward = QLabel()
+
+    lbl_3d.setAlignment(Qt.AlignCenter)
+    lbl_xy.setAlignment(Qt.AlignCenter)
+    lbl_reward.setAlignment(Qt.AlignCenter)
+
+    lbl_3d.setMinimumSize(400, 265)
+    lbl_xy.setMinimumSize(400, 247)
+    lbl_reward.setMinimumSize(400, 212)
+
+
+    layout.addWidget(lbl_3d, stretch=1)
+    layout.addWidget(lbl_xy, stretch=1)
+    layout.addWidget(lbl_reward, stretch=2)
+
+    latest = [None]
+
+    # =========================
+    # Qt render helper (HIGH DPI SAFE)
+    # =========================
+    def render_to_label(fig, label, dpi=200):
+        w = label.width()
+        h = label.height()
+
+        fig.set_size_inches(w / dpi, h / dpi, forward=True)
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi)
+        plt.close(fig)
+
+        buf.seek(0)
+
+        img = QImage()
+        img.loadFromData(buf.read())
+
+        label.setPixmap(
+            QPixmap.fromImage(img).scaled(
+                w,
+                h,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+        )
+
+    def drain_queue():
+        try:
+            while True:
+                latest[0] = path_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    # =========================
+    # MAIN LOOP
+    # =========================
+    def refresh():
+        drain_queue()
+
+        if latest[0] is None:
+            return
+
+        path, startpoint, endpoint, reward_hist = latest[0]
+
+        path = np.asarray(path, dtype=float)
+        startpoint = np.asarray(startpoint, dtype=float).reshape(-1)
+        endpoint = np.asarray(endpoint, dtype=float).reshape(-1)
+
+        distance = np.linalg.norm(endpoint - path[-1][0:3]) / np.linalg.norm(endpoint - startpoint)
+        distance = 0
+        # =========================
+        # 3D PLOT (TRUE SCALE)
+        # =========================
+        fig1 = plt.figure()
+        ax1 = fig1.add_subplot(111, projection="3d")
+
+        ax1.plot(path[:, 0], path[:, 1], path[:, 2],
+                 color="blue", linewidth=2)
+
+        ax1.scatter(*startpoint, color="green", s=30)
+        if distance < 0.7:
+            ax1.scatter(*endpoint, color="red", s=30)
+
+        x = np.concatenate([path[:, 0], [startpoint[0], endpoint[0]]])
+        y = np.concatenate([path[:, 1], [startpoint[1], endpoint[1]]])
+        z = np.concatenate([path[:, 2], [startpoint[2], endpoint[2]]])
+
+        max_range = np.ptp([x, y, z], axis=1).max()
+
+        if max_range < 1e-6:
+            max_range = 1.0
+
+        mid_x = (x.max() + x.min()) / 2
+        mid_y = (y.max() + y.min()) / 2
+        mid_z = (z.max() + z.min()) / 2
+
+        ax1.set_xlim(mid_x - max_range/2, mid_x + max_range/2)
+        ax1.set_ylim(mid_y - max_range/2, mid_y + max_range/2)
+        ax1.set_zlim(mid_z - max_range/2, mid_z + max_range/2)
+
+        ax1.set_title("3D Path (1:1 scale)")
+
+        render_to_label(fig1, lbl_3d)
+
+        # =========================
+        # XY + SIDE VIEW
+        # =========================
+        fig = plt.figure()
+
+        ax_xy = fig.add_subplot(1, 2, 1)
+        ax_side = fig.add_subplot(1, 2, 2)
+
+        n = min(len(path), len(reward_hist))
+        path_plot = np.array(path[:n])
+
+        scores = np.array([
+            r.get("total", {}).get("v", 0.0)
+            for r in reward_hist[:n]
+        ], dtype=float)
+
+        norm = matplotlib.colors.Normalize(vmin=0, vmax=1)
+        cmap = plt.get_cmap("viridis")
+        colors = cmap(norm(scores))
+
+        # =========================
+        # XY (true scale)
+        # =========================
+        ax_xy.scatter(startpoint[0], startpoint[1], color="green", s=20)
+        if distance < 0.7:
+            ax_xy.scatter(endpoint[0], endpoint[1], color="red", s=20)
+        ax_xy.scatter(path_plot[:, 0], path_plot[:, 1], c=colors, s=10, alpha=0.5)
+
+        # Left panel: drone body +X (same axis as onboard camera in BaseAviary) on XY.
+        if path_plot.shape[0] > 0 and path_plot.shape[1] >= 6:
+            xy_pts = path_plot[:, 0:2]
+            span = float(
+                max(
+                    np.ptp(xy_pts[:, 0]) if xy_pts.shape[0] else 0.0,
+                    np.ptp(xy_pts[:, 1]) if xy_pts.shape[0] else 0.0,
+                    np.linalg.norm(endpoint[:2] - startpoint[:2]),
+                    0.5,
+                )
+            )
+            arrow_len = max(0.05 * span, 0.15)
+            step = max(1, path_plot.shape[0] // 25)
+            for i in range(0, path_plot.shape[0], step):
+                roll, pitch, yaw = (
+                    float(path_plot[i, 3]),
+                    float(path_plot[i, 4]),
+                    float(path_plot[i, 5]),
+                )
+                rm = np.array(
+                    p.getMatrixFromQuaternion(p.getQuaternionFromEuler([roll, pitch, yaw]))
+                ).reshape(3, 3)
+                fx, fy = float(rm[0, 0]), float(rm[1, 0])
+                nrm = math.hypot(fx, fy)
+                if nrm < 1e-8:
+                    continue
+                fx /= nrm
+                fy /= nrm
+                px, py = float(path_plot[i, 0]), float(path_plot[i, 1])
+                ax_xy.annotate(
+                    "",
+                    xytext=(px, py),
+                    xy=(px + fx * arrow_len, py + fy * arrow_len),
+                    arrowprops=dict(
+                        arrowstyle="-",
+                        color="0.15",
+                        lw=0.75,
+                        alpha=0.42,
+                        shrinkA=0,
+                        shrinkB=0,
+                    ),
+                    zorder=5,
+                )
+            li = path_plot.shape[0] - 1
+            roll, pitch, yaw = (
+                float(path_plot[li, 3]),
+                float(path_plot[li, 4]),
+                float(path_plot[li, 5]),
+            )
+            rm = np.array(
+                p.getMatrixFromQuaternion(p.getQuaternionFromEuler([roll, pitch, yaw]))
+            ).reshape(3, 3)
+            fx, fy = float(rm[0, 0]), float(rm[1, 0])
+            nrm = math.hypot(fx, fy)
+            if nrm >= 1e-8:
+                fx /= nrm
+                fy /= nrm
+                px, py = float(path_plot[li, 0]), float(path_plot[li, 1])
+                ax_xy.annotate(
+                    "",
+                    xytext=(px, py),
+                    xy=(px + fx * arrow_len * 1.35, py + fy * arrow_len * 1.35),
+                    arrowprops=dict(
+                        arrowstyle="-|>",
+                        color="orangered",
+                        lw=1.2,
+                        alpha=0.9,
+                        shrinkA=0,
+                        shrinkB=0,
+                    ),
+                    zorder=6,
+                )
+
+        ax_xy.set_aspect("equal", adjustable="box")
+        ax_xy.set_title("XY Path (1:1)")
+
+        # =========================
+        # SIDE VIEW
+        # =========================
+        start_xy = np.array(startpoint[:2])
+        end_xy = np.array(endpoint[:2])
+
+        direction = end_xy - start_xy
+        direction_norm = direction / (np.linalg.norm(direction) + 1e-8)
+
+        rel = path_plot[:, :2] - start_xy
+        dist = np.dot(rel, direction_norm)
+        z_vals = path_plot[:, 2]
+
+        ax_side.scatter(dist, z_vals, c=colors, s=10, alpha=0.5)
+
+        if distance < 0.7:
+            ax_side.plot([0, np.linalg.norm(direction)],
+                     [startpoint[2], endpoint[2]],
+                     linestyle="--", color="gray")
+        ax_side.set_aspect("equal", adjustable="box")
+
+        ax_side.set_title("Distance vs Z")
+
+        sm = plt.cm.ScalarMappable(cmap="viridis", norm=norm)
+        sm.set_array(scores)
+
+        fig.colorbar(sm, ax=[ax_xy, ax_side], label="Score")
+
+        render_to_label(fig, lbl_xy)
+
+        # =========================
+        # REWARD PLOT (SAFE + VALUE CHART)
+        # =========================
+        if reward_hist and reward_hist[0]:
+
+            fig3 = plt.figure(figsize=(6, 6))
+            ax_top = fig3.add_subplot(2, 1, 1)
+            ax_bottom = fig3.add_subplot(2, 1, 2)
+
+            n = len(reward_hist)
+
+            # =========================
+            # TOP: processed reward ("v")
+            # =========================
+            for vname, meta in reward_hist[0].items():
+                if vname in ("total", "success") or not meta:
+                    continue
+
+                ys = np.array([
+                    float(reward_hist[i].get(vname, {}).get("v", 0.0))
+                    for i in range(n)
+                ], dtype=float)
+
+                ax_top.plot(
+                    ys,
+                    # label=meta.get("label", vname),
+                    color=meta.get("color", "black"),
+                    linewidth=meta.get("linewidth", 1.5),
+                    linestyle=meta.get("linestyle", "--")
+                )
+
+            total_v = np.array([
+                float(r.get("total", {}).get("v", 0.0))
+                for r in reward_hist
+            ], dtype=float)
+
+            ax_top.plot(total_v, color="orange", label="Total (v)", linewidth=2, linestyle="solid")
+
+            ax_top.set_title("Reward Components (Processed v)")
+            ax_top.set_xlabel("Step")
+            ax_top.set_ylabel("Reward (v)")
+            ax_top.legend(fontsize="x-small")
+            ax_top.grid(True, alpha=0.2)
+
+            # =========================
+            # BOTTOM: raw values ("value")
+            # =========================
+            for vname, meta in reward_hist[0].items():
+                if vname in ("total", "success") or not meta:
+                    continue
+
+                ys = np.array([
+                    float(
+                        reward_hist[i]
+                        .get(vname, {})
+                        .get("value",
+                            reward_hist[i].get(vname, {}).get("v", 0.0))
+                    )
+                    for i in range(n)
+                ], dtype=float)
+
+                ax_bottom.plot(
+                    ys,
+                    linestyle=meta.get("linestyle", "--"),
+                    alpha=0.8,
+                    # label=meta.get("label", vname),
+                    color=meta.get("color", "black"),
+                    linewidth=meta.get("linewidth", 1.0)
+                )
+
+            total_raw = np.array([
+                float(
+                    r.get("total", {}).get("value",
+                    r.get("total", {}).get("v", 0.0))
+                )
+                for r in reward_hist
+            ], dtype=float)
+
+            ax_bottom.plot(total_raw, color="orange", label="Total (raw)", linewidth=2, linestyle="solid")
+
+            ax_bottom.set_title("Reward Components (Raw values)")
+            ax_bottom.set_xlabel("Step")
+            ax_bottom.set_ylabel("Reward (raw)", color=meta.get("color", "black"))
+            ax_bottom.legend(fontsize="x-small")
+            ax_bottom.grid(True, alpha=0.2)
+
+            # =========================
+            # FINAL RENDER
+            # =========================
+            render_to_label(fig3, lbl_reward)
+
+    timer = QTimer()
+    timer.timeout.connect(refresh)
+    timer.start(200)
+
+    win.resize(440, 560)
+    win.show()
+    app.exec_()
+
 
 class MovingDroneAviary(BaseRLAviary):
     """
@@ -49,6 +422,7 @@ class MovingDroneAviary(BaseRLAviary):
     """
     MAX_TILT_RAD: float = 1.047         # safety cut‑off for roll / pitch (rad)
     _fov: float = 90.0
+    PATH_MONITOR_STEP_INTERVAL: int = 120   # Qt path monitor refresh within an episode
 
     # --------------------------------------------------------------------- #
     # 1. constructor
@@ -62,6 +436,7 @@ class MovingDroneAviary(BaseRLAviary):
         ctrl_freq   : int          = 30,
         gui         : bool         = False,
         record      : bool         = False,
+        path_monitor: bool         = False,
         obs         : ObservationType = ObservationType.RGB,
         act         : ActionType      = ActionType.RPM,
     ):
@@ -70,8 +445,19 @@ class MovingDroneAviary(BaseRLAviary):
         ----------
         task : MapTask
             Must expose `.start`, `.goal`, `.horizon`, `.sim_dt`.
+        path_monitor : bool
+            When True, start the Qt matplotlib path/reward monitor (see also ``SWARM_PATH_MONITOR``).
         Remaining arguments are forwarded to ``BaseRLAviary`` unchanged.
         """
+        self._path_monitor_queue = queue.Queue(maxsize=1)
+        self._path_monitor_thread = threading.Thread(
+            target=_moving_drone_path_monitor_main,
+            args=(self._path_monitor_queue, path_monitor),
+            daemon=True,
+            name="MovingDronePathMonitor",
+        )
+        self._path_monitor_thread.start()
+
         self.task       = task
         self._original_start = tuple(task.start)
         self._original_goal = tuple(task.goal)
@@ -99,6 +485,15 @@ class MovingDroneAviary(BaseRLAviary):
 
         self._init_platform_randomization(seed)
         self._search_area_center = self.GOAL_POS.copy()
+        
+        self.state_history = []
+        self.reward_history = []
+        self.last_reward_history = []
+        self._path_monitor_ctrl_step = 0
+        self._original_start = np.array(task.start)
+        self._original_goal = np.array(task.goal)
+        self._prev_path_progress_01 = 0.0
+        self._schedule_deadline_trunc = False
 
         fov_rng = np.random.RandomState(seed)
         fov_rng.rand()
@@ -408,16 +803,30 @@ class MovingDroneAviary(BaseRLAviary):
             exit()
         
         cli = getattr(self, "CLIENT", 0)
-        drone_pos = self.pos[nth_drone, :]
-        rot_mat = np.array(p.getMatrixFromQuaternion(self.quat[nth_drone, :])).reshape(3, 3)
-        
+        drone_pos = np.asarray(self.pos[nth_drone, :], dtype=np.float64)
+        if not np.isfinite(drone_pos).all():
+            drone_pos = np.nan_to_num(drone_pos, nan=0.0)
+        quat = np.asarray(self.quat[nth_drone, :], dtype=np.float64)
+        if not np.isfinite(quat).all():
+            rot_mat = np.eye(3, dtype=np.float64)
+        else:
+            rot_mat = np.array(p.getMatrixFromQuaternion(quat.tolist())).reshape(3, 3)
+            if not np.isfinite(rot_mat).all():
+                rot_mat = np.eye(3, dtype=np.float64)
+
         forward = rot_mat @ np.array([1.0, 0.0, 0.0])
-        forward = forward / np.linalg.norm(forward)
+        fn = float(np.linalg.norm(forward))
+        if not np.isfinite(fn) or fn < 1e-9:
+            forward = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            forward = forward / fn
         up = rot_mat @ np.array([0.0, 0.0, 1.0])
         
         camera_offset = 0.13
         camera_pos = drone_pos + forward * camera_offset + up * 0.05
-        
+        if not np.isfinite(camera_pos).all():
+            camera_pos = np.nan_to_num(camera_pos, nan=0.0)
+
         target = camera_pos + forward * 20.0
         
         DRONE_CAM_VIEW = p.computeViewMatrix(
@@ -470,12 +879,22 @@ class MovingDroneAviary(BaseRLAviary):
         hit_uid, _, hit_frac, _, _ = result[0]
 
         if hit_uid != -1:
+            hf = float(hit_frac)
+            if not np.isfinite(hf):
+                hf = 1.0
+            hf = float(np.clip(hf, 0.0, 1.0))
             seg_len = MAX_RAY_DISTANCE - ray_origin_offset
-            return min(MAX_RAY_DISTANCE, ray_origin_offset + hit_frac * seg_len)
+            return min(MAX_RAY_DISTANCE, ray_origin_offset + hf * seg_len)
         return MAX_RAY_DISTANCE
 
     def _process_depth(self, depth_buffer: np.ndarray) -> np.ndarray:
         """Convert PyBullet depth buffer to normalized depth map [0,1] for 0.5-20m range."""
+        depth_buffer = np.nan_to_num(
+            np.asarray(depth_buffer, dtype=np.float64),
+            nan=1.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
         depth_buffer = np.clip(depth_buffer, 0.0, 1.0)
         
         denominator = DEPTH_FAR - (DEPTH_FAR - DEPTH_NEAR) * depth_buffer
@@ -727,11 +1146,36 @@ class MovingDroneAviary(BaseRLAviary):
         if min_dist < self._min_clearance_episode:
             self._min_clearance_episode = min_dist
 
+    def _enqueue_path_monitor_snapshot(self) -> None:
+        """Notify Qt path monitor (non-blocking; queue keeps latest only)."""
+        if len(self.state_history) == 0:
+            return
+        if self.task is None:
+            return
+        snap = (
+            np.asarray(self.state_history, dtype=np.float64).copy(),
+            np.asarray(self.task.start, dtype=np.float64).copy(),
+            np.asarray(self.task.goal, dtype=np.float64).copy(),
+            copy.deepcopy(self.reward_history),
+        )
+        try:
+            self._path_monitor_queue.put_nowait(snap)
+        except queue.Full:
+            try:
+                self._path_monitor_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._path_monitor_queue.put_nowait(snap)
+
     # --------------------------------------------------------------------- #
     # 3. OpenAI‑Gym API overrides
     # --------------------------------------------------------------------- #
     def reset(self, **kwargs):
         """Reset environment and internal state for a new episode."""
+        if len(self.state_history) > 0:
+            self._enqueue_path_monitor_snapshot()
+            self.state_history = []
+
         seed = kwargs.get('seed', None)
         if seed is None:
             seed = getattr(self.task, 'map_seed', None)
@@ -751,20 +1195,29 @@ class MovingDroneAviary(BaseRLAviary):
         self._prev_platform_pos = None
         self._platform_velocity = np.zeros(3, dtype=np.float32)
         self._platform_offsets = []
+        self._path_monitor_ctrl_step = 0
+        self._schedule_deadline_trunc = False
         self._reset_action_buffer()
 
-        self._prev_score = flight_reward(
+        (self._prev_score, rewards) = flight_reward(
             success=False,
             t=0.0,
             horizon=self.EP_LEN_SEC,
             task=None,
             min_clearance=self._min_clearance_episode,
             collision=self._collision,
+            state=None,
+            state_history=None,
         )
-
+        if len(self.reward_history) > 0:
+            self.last_reward_history = copy.deepcopy(self.reward_history)
+        else:
+            self.last_reward_history = []
+        self.reward_history = []
         self._spawn_task_world()
         self._search_area_center = self._generate_search_area_center(seed=seed)
         self._updateAndStoreKinematicInformation()
+        self._sync_path_progress_baseline()
 
         cli = getattr(self, "CLIENT", 0)
         p.setPhysicsEngineParameter(
@@ -894,6 +1347,9 @@ class MovingDroneAviary(BaseRLAviary):
         truncated = self._computeTruncated()
         info = self._computeInfo()
         self.step_counter = self.step_counter + (1 * self.PYB_STEPS_PER_CTRL)
+        self._path_monitor_ctrl_step += 1
+        if self._path_monitor_ctrl_step % self.PATH_MONITOR_STEP_INTERVAL == 0:
+            self._enqueue_path_monitor_snapshot()
         return obs, reward, terminated, truncated, info
 
     def _process_step_updates(self):
@@ -1002,14 +1458,18 @@ class MovingDroneAviary(BaseRLAviary):
     # -------- reward ----------------------------------------------------- #
     def _computeReward(self) -> float:
         """Compute incremental reward based on current state."""
-        score = flight_reward(
+        (score, rewards) = flight_reward(
             success=self._success,
             t=(self._t_to_goal if self._success else self._time_alive),
             horizon=self.EP_LEN_SEC,
             task=self.task,
             min_clearance=self._min_clearance_episode,
             collision=self._collision,
+            state=self._getDroneStateVector(0),
+            state_history=np.array(self.state_history, dtype=np.float64),
         )
+        self.reward_history.append(rewards)
+        self._schedule_deadline_trunc = bool(rewards.get("schedule_deadline_fail", False))
 
         r_t = score - self._prev_score
         self._prev_score = score
@@ -1025,6 +1485,8 @@ class MovingDroneAviary(BaseRLAviary):
         """
         Early termination on excessive tilt or elapsed horizon.
         """
+        if self._schedule_deadline_trunc:
+            return True
         # safety cut‑off
         state = self._getDroneStateVector(0)
         roll, pitch = state[7], state[8]
@@ -1035,17 +1497,38 @@ class MovingDroneAviary(BaseRLAviary):
         return self._time_alive >= self.EP_LEN_SEC
 
     # -------- extra logging --------------------------------------------- #
+    def _path_progress_01(self, pos: np.ndarray) -> float:
+        """Projection onto start→goal: 0 at start, 1 at goal (can be <0 or >1 off segment)."""
+        s = np.asarray(self.task.start, dtype=np.float64)
+        g = np.asarray(self.GOAL_POS, dtype=np.float64)
+        path = g - s
+        path_len2 = float(np.dot(path, path))
+        if path_len2 < 1e-18:
+            return 0.0
+        return float(np.dot(np.asarray(pos, dtype=np.float64) - s, path) / path_len2)
+
+    def _sync_path_progress_baseline(self) -> None:
+        """Call after spawn so TensorBoard delta starts from the actual episode origin."""
+        state = self._getDroneStateVector(0)
+        self._prev_path_progress_01 = self._path_progress_01(state[0:3])
+
     def _computeInfo(self):
         state = self._getDroneStateVector(0)
-        dist  = float(np.linalg.norm(state[0:3] - self.GOAL_POS))
+        pos = state[0:3]
+        dist = float(np.linalg.norm(pos - self.GOAL_POS))
+        pp = self._path_progress_01(pos)
+        pp_delta = pp - self._prev_path_progress_01
+        self._prev_path_progress_01 = pp
         return {
-            "distance_to_goal"    : dist,
-            "score"               : self._prev_score,
-            "success"             : self._success,
-            "collision"           : self._collision,
-            "t_to_goal"           : self._t_to_goal,
-            "min_clearance"       : self._min_clearance_episode,
-            "landing_stable_time" : self._landing_stable_time,
+            "distance_to_goal": dist,
+            "path_progress_01": pp,
+            "path_progress_delta": float(pp_delta),
+            "score": self._prev_score,
+            "success": self._success,
+            "collision": self._collision,
+            "t_to_goal": self._t_to_goal,
+            "min_clearance": self._min_clearance_episode,
+            "landing_stable_time": self._landing_stable_time,
         }
 
     # -------- observation extension -------------------------------------- #
@@ -1069,25 +1552,39 @@ class MovingDroneAviary(BaseRLAviary):
         self.dep[0] = depth_raw
         depth = self._process_depth(depth_raw)
 
-        state_vec = self._getDroneStateVector(0)
+        state_vec = np.nan_to_num(
+            np.asarray(self._getDroneStateVector(0), dtype=np.float32),
+            nan=0.0,
+            posinf=1e6,
+            neginf=-1e6,
+        )
         obs_12 = np.hstack([
             state_vec[0:3],
             state_vec[7:10],
             state_vec[10:13],
             state_vec[13:16]
         ]).astype(np.float32)
+        self.state_history.append(obs_12)
 
         state_full = np.array([obs_12], dtype=np.float32)
         for i in range(self.ACTION_BUFFER_SIZE):
             state_full = np.hstack([state_full, np.array([self.action_buffer[i][0, :]])])
         state_full = state_full.flatten().astype(np.float32)
 
-        altitude = self._get_altitude_distance() / MAX_RAY_DISTANCE
+        alt_m = float(self._get_altitude_distance())
+        if not np.isfinite(alt_m):
+            alt_m = float(MAX_RAY_DISTANCE)
+        altitude = float(np.clip(alt_m / MAX_RAY_DISTANCE, 0.0, 1.0))
         state_full = np.append(state_full, altitude).astype(np.float32)
 
         drone_pos = state_vec[0:3]
         search_area_vector = (self._search_area_center - drone_pos).astype(np.float32)
+        search_area_vector = np.nan_to_num(search_area_vector, nan=0.0, posinf=1e6, neginf=-1e6)
         state_full = np.append(state_full, search_area_vector).astype(np.float32)
+
+        state_full = np.nan_to_num(
+            state_full, nan=0.0, posinf=1e6, neginf=-1e6
+        ).astype(np.float32)
 
         actual_state_dim = state_full.shape[0]
         if actual_state_dim != self._state_dim:
@@ -1101,6 +1598,9 @@ class MovingDroneAviary(BaseRLAviary):
                     dtype=np.float32
                 ),
             })
+
+        depth = np.nan_to_num(depth, nan=1.0, posinf=1.0, neginf=0.0)
+        depth = np.clip(depth, 0.0, 1.0).astype(np.float32)
 
         return {
             "depth": depth,

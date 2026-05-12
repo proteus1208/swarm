@@ -607,7 +607,7 @@ def _run_multi_seed_rpc_sync(
                         else:
                             min_clearance = info.get("min_clearance", None)
                             collision = info.get("collision", False)
-                            score = flight_reward(
+                            score, history = flight_reward(
                                 success=success,
                                 t=t_sim,
                                 horizon=task.horizon,

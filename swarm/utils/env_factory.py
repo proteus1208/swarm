@@ -59,6 +59,7 @@ def make_env(
     task: MapTask,
     *,
     gui: bool = False,
+    path_monitor: bool = False,
 ) -> MovingDroneAviary:
     """
     Create and fully‑initialised single‑drone PyBullet Crazyflie environment.
@@ -67,6 +68,7 @@ def make_env(
     ----------
     task     : MapTask   • scenario description (start, goal, map seed, dt, …)
     gui      : bool      • enable/disable PyBullet viewer (default False)
+    path_monitor : bool  • enable Qt path/reward monitor in ``MovingDroneAviary`` (default False)
     Returns
     -------
     env : MovingDroneAviary
@@ -77,6 +79,7 @@ def make_env(
     common_kwargs = dict(
         gui=gui,
         record=False,
+        path_monitor=path_monitor,
         obs=ObservationType.RGB,
         ctrl_freq=ctrl_freq,
         pyb_freq=ctrl_freq,

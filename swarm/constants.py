@@ -279,13 +279,21 @@ SCREENING_TEMPLATE: list[dict] = _build_screening_template()
 # =============================================================================
 
 CHALLENGE_TYPE_DISTRIBUTION = {
-    1: 1 / 6,  # City navigation (procedural roads)
-    2: 1 / 6,  # Open flight (no obstacles)
-    3: 1 / 6,  # Mountain navigation
-    4: 1 / 6,  # Village navigation
-    5: 1 / 6,  # Warehouse navigation
-    6: 1 / 6,  # Forest navigation
+    1: 6 / 6,  # City navigation (procedural roads)
+    2: 0 / 6,  # Open flight (no obstacles)
+    3: 0 / 6,  # Mountain navigation
+    4: 0 / 6,  # Village navigation
+    5: 0 / 6,  # Warehouse navigation
+    6: 0 / 6,  # Forest navigation
 }
+# CHALLENGE_TYPE_DISTRIBUTION = {
+#     1: 1 / 6,  # City navigation (procedural roads)
+#     2: 1 / 6,  # Open flight (no obstacles)
+#     3: 1 / 6,  # Mountain navigation
+#     4: 1 / 6,  # Village navigation
+#     5: 1 / 6,  # Warehouse navigation
+#     6: 1 / 6,  # Forest navigation
+# }
 
 assert abs(sum(CHALLENGE_TYPE_DISTRIBUTION.values()) - 1.0) < 0.001, "Challenge probabilities must sum to 1.0"
 

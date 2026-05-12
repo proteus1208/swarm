@@ -76,7 +76,7 @@ def test_flight_reward_failed_mission_zero_for_illegitimate():
 
 def test_flight_reward_success_with_fast_time_and_safe_clearance_is_one():
     task = _sample_task()
-    score = flight_reward(
+    score, history = flight_reward(
         success=True,
         t=0.1,
         horizon=60.0,
@@ -87,7 +87,7 @@ def test_flight_reward_success_with_fast_time_and_safe_clearance_is_one():
 
 
 def test_flight_reward_success_without_task_uses_linear_time_term():
-    score = flight_reward(
+    score, history = flight_reward(
         success=True,
         t=5.0,
         horizon=10.0,
@@ -101,7 +101,7 @@ def test_flight_reward_success_without_task_uses_linear_time_term():
 def test_flight_reward_with_task_and_horizon_below_target_forces_zero_time_term():
     task = _sample_task()
     target = _calculate_target_time(task)
-    score = flight_reward(
+    score, history = flight_reward(
         success=True,
         t=target + 1.0,
         horizon=target - 0.1,
@@ -115,7 +115,7 @@ def test_flight_reward_with_task_and_horizon_below_target_forces_zero_time_term(
 def test_flight_reward_uses_safety_interpolation():
     task = _sample_task()
     mid = (SAFETY_DISTANCE_SAFE + SAFETY_DISTANCE_DANGER) / 2.0
-    score = flight_reward(
+    score, history = flight_reward(
         success=True,
         t=0.1,
         horizon=60.0,

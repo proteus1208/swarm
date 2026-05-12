@@ -149,9 +149,20 @@ def _build_task_with_params(
             start_z = 1.5
         start = (0.0, 0.0, start_z)
         goal = _goal_from_origin(rng, params)
+        
+    # Sample uniformly random angle in degrees
+    alpha = rng.uniform(0, 360)
+    # Set the distance
+    r = 15
+    # Calculate vgoal (goal position vector from start)
+    # Convert alpha to radians for trig functions
+    alpha_rad = math.radians(alpha)
+    vgoal = (r * math.cos(alpha_rad), r * math.sin(alpha_rad), 0)
 
     return MapTask(
         map_seed=seed,
+        # start=(0,0,0),
+        # goal=vgoal,
         start=start,
         goal=goal,
         sim_dt=sim_dt,

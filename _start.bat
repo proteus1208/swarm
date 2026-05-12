@@ -1,0 +1,1 @@
+cmd /k ".\venv\Scripts\activate & python .\RL\train_RL.py --n-env 8 --torch-threads 4 --init
