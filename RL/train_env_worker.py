@@ -25,9 +25,41 @@ def make_training_env(
     path_monitor: bool = False,
 ):
     def _init():
-        task = random_task(sim_dt=SIM_DT, seed=seed)
-        env = make_env(task, gui=gui, path_monitor=path_monitor)
-        env = RecordEpisodeStatistics(env)
-        return env
+        last_error = None
+
+        for attempt in range(200):
+            task_seed = seed + attempt * 10007
+
+            try:
+                task = random_task(sim_dt=SIM_DT, seed=task_seed)
+
+                env = make_env(
+                    task,
+                    gui=False,
+                    path_monitor=path_monitor,
+                )
+
+                env = RecordEpisodeStatistics(env)
+                return env
+
+            except RuntimeError as e:
+                msg = str(e)
+
+                if "unable to find collision-free platform position" in msg:
+                    last_error = e
+                    print(
+                        f"[env retry] base_seed={seed} "
+                        f"attempt={attempt + 1} "
+                        f"task_seed={task_seed} "
+                        f"error={e}"
+                    )
+                    continue
+
+                raise
+
+        raise RuntimeError(
+            f"Failed to create environment after 200 retries. "
+            f"base_seed={seed}. Last error: {last_error}"
+        )
 
     return _init

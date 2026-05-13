@@ -1,37 +1,30 @@
 # swarm/validator/reward.py
 """Reward function for flight missions.
 
-The score is a weighted combination of mission success, time efficiency, and safety::
+Current active reward is a pretraining reward:
 
-    score = 0.45 * success_term + 0.45 * time_term + 0.10 * safety_term
+- speed in the drone forward direction
+- active horizontal movement
+- yaw facing goal
+- movement aligned with yaw
+- small z change
+- safe/stable attitude
 
-where
+Important:
+- The active reward does NOT use ``state[10:13]`` as velocity.
+- Velocity is estimated from ``state_history`` position differences.
 
-* ``success_term`` is ``1`` if the mission reaches its goal and ``0``
-  otherwise.
-* ``time_term`` is based on minimum theoretical time with 6% buffer.
-* ``safety_term`` is based on minimum obstacle clearance during flight.
-
-All weights sum to one. The final score is clamped to ``[0, 1]``.
+Old mission-shaping reward logic is kept as commented reference inside
+``flight_reward``.
 """
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
-import numpy as np
-import sys
 import itertools
+import sys
 
-_spinner = itertools.cycle("|/-\\")
-
-def spin_print(*args):
-    return 
-    prefix = next(_spinner)
-    msg = " ".join(str(a) for a in args)
-
-    # Same line output
-    sys.stdout.write(f"\r{prefix} {msg}")
-    sys.stdout.flush()
+import numpy as np
 
 if TYPE_CHECKING:
     from swarm.protocol import MapTask
@@ -47,20 +40,39 @@ from swarm.constants import (
     TYPE_6_SAFETY_DISTANCE_SAFE,
 )
 
+
+_spinner = itertools.cycle("|/-\\")
+
+
+def spin_print(*args):
+    prefix = next(_spinner)
+    msg = " ".join(str(a) for a in args)
+
+    sys.stdout.write(f"\r{prefix} {msg}")
+    sys.stdout.flush()
+
+
 SAFETY_DISTANCE_SAFE_BY_TYPE = {
     6: TYPE_6_SAFETY_DISTANCE_SAFE,
 }
 
 MAX_HZ = 60
 MAX_FRAMES = 3000
-MAX_SPEED = 3
+MAX_SPEED = 3.0
 DECEL_RADIUS = 1.5
+
+# New pretraining constants
+HISTORY_VEL_FRAMES = 10
+ACTIVE_SPEED_FULL = 1.2
+MAX_Z_SPEED_SMALL_CHANGE = 0.35
+MOVEMENT_EPS = 1e-8
 
 __all__ = ["flight_reward"]
 
 
 def scaled_tanh(x, lower, upper):
     return lower + (upper - lower) * ((np.tanh(x) + 1) / 2)
+
 
 def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     """Clamp *value* to the inclusive range [*lower*, *upper*]."""
@@ -78,52 +90,26 @@ def _calculate_target_time(task: "MapTask") -> float:
 
 
 def _calculate_safety_term(
-    min_clearance: float, collision: bool, challenge_type: int = 0
+    min_clearance: float,
+    collision: bool,
+    challenge_type: int = 0,
 ) -> float:
     """Calculate safety term based on minimum obstacle clearance."""
     if collision:
         return 0.0
+
     safe = SAFETY_DISTANCE_SAFE_BY_TYPE.get(challenge_type, SAFETY_DISTANCE_SAFE)
+
     if min_clearance >= safe:
         return 1.0
+
     if min_clearance <= SAFETY_DISTANCE_DANGER:
         return 0.0
-    return (min_clearance - SAFETY_DISTANCE_DANGER) / (safe - SAFETY_DISTANCE_DANGER)
 
-# def disScore(s, e, p):
-#     """
-#     Same logic preserved:
-#     - m1: proximity-to-start signal
-#     - m2: proximity-to-end signal
-#     - path consistency penalty unchanged
-#     - fully 3D compatible (no logic change)
-#     """
+    return (min_clearance - SAFETY_DISTANCE_DANGER) / (
+        safe - SAFETY_DISTANCE_DANGER
+    )
 
-#     s = np.asarray(s, dtype=np.float32)
-#     e = np.asarray(e, dtype=np.float32)
-#     p = np.asarray(p, dtype=np.float32)
-
-#     dist_total = np.linalg.norm(e - s)
-#     if dist_total < 1e-8:
-#         return 0.0
-
-#     dist_to_s = np.linalg.norm(p - s)
-#     dist_to_e = np.linalg.norm(p - e)
-
-#     m1 = 1.0 - dist_to_s / dist_total
-#     m2 = 1.0 - dist_to_e / dist_total
-
-#     # only meaningful region: between start and end
-#     if m2 <= 0.0:
-#         return 0.0
-
-#     path_penalty = np.exp(
-#         -6.0 * abs(dist_to_s + dist_to_e - dist_total)
-#     )
-
-#     reward = (m1 + m2) * m2 * path_penalty
-
-#     return float(np.clip(reward, 0.0, 1.0))
 
 def disScore(s, e, p):
     """
@@ -131,9 +117,8 @@ def disScore(s, e, p):
     - m1: proximity-to-start signal
     - m2: proximity-to-end signal
     - path consistency penalty unchanged
-    - fully 3D compatible (no logic change)
+    - fully 3D compatible
     """
-
     s = np.asarray(s, dtype=np.float32)
     e = np.asarray(e, dtype=np.float32)
     p = np.asarray(p, dtype=np.float32)
@@ -148,7 +133,6 @@ def disScore(s, e, p):
     m1 = 1.0 - dist_to_s / dist_total
     m2 = 1.0 - dist_to_e / dist_total
 
-    # only meaningful region: between start and end
     if m2 <= 0.0:
         return 0.0
 
@@ -160,27 +144,24 @@ def disScore(s, e, p):
 
     return float(np.clip(reward, 0.0, 1.0))
 
+
 def forwardDirectionReward(current, endpoint, yaw):
     current = np.array(current)
     endpoint = np.array(endpoint)
 
-    # direction vector to destination
     direction = endpoint - current
 
-    # target yaw angle toward destination
     target_yaw = np.arctan2(direction[1], direction[0])
 
-    # angle error wrapped to [-pi, pi]
     angle_error = target_yaw - yaw
     angle_error = np.arctan2(np.sin(angle_error), np.cos(angle_error))
 
-    # normalize error: 0 = perfect, 1 = opposite direction
     normalized_error = abs(angle_error) / np.pi
 
-    # squared reward, output 0 ~ 1
     reward = (1.0 - normalized_error) ** 2
 
     return float(np.clip(reward, 0.0, 1.0))
+
 
 def forwardScore(e, p, v, k=8.0):
     e = np.asarray(e, dtype=np.float64)
@@ -191,11 +172,9 @@ def forwardScore(e, p, v, k=8.0):
     dist = np.linalg.norm(dir_vec)
     speed = np.linalg.norm(v)
 
-    # Already at target: forward direction is not meaningful
     if dist < 1e-8:
         return 0.0
 
-    # No movement should not get forward reward
     if speed < 1e-8:
         return 0.0
 
@@ -205,23 +184,16 @@ def forwardScore(e, p, v, k=8.0):
     dot = np.clip(np.dot(dir_unit, vel_unit), -1.0, 1.0)
     cross_norm = np.linalg.norm(np.cross(dir_unit, vel_unit))
 
-    # alpha = 0 means perfect direction
-    # alpha = 1 means opposite direction
     alpha = np.arctan2(cross_norm, dot) / np.pi
 
-    # Better than alpha^2 directly because this gives high value when correct
-    direction_reward = np.exp(-k * alpha ** 2)
+    direction_reward = np.exp(-k * alpha**2)
 
-    speed_factor = 1
-    # speed_factor = np.clip(speed / MAX_SPEED, 0.0, 1.0)
+    speed_factor = 1.0
 
     score = direction_reward * speed_factor
 
-    # # Penalize going faster than max speed
-    # if speed > MAX_SPEED:
-    #     score *= 1.0 / (1.0 + speed - MAX_SPEED)
-
     return float(np.clip(score, 0.0, 1.0))
+
 
 def progressScore(start, goal, state_history):
     start = np.asarray(start, dtype=np.float32)
@@ -246,10 +218,7 @@ def progressScore(start, goal, state_history):
 
     distance_delta = dist_prev - dist_now
 
-    max_dist = 3.0 / 50.0;
-    # max_dist = np.linalg.norm(goal - start) + 1e-6
-
-    # return (distance_delta / max_dist);
+    max_dist = 3.0 / 50.0
 
     r_progress = direction_cos + (distance_delta / max_dist)
 
@@ -262,6 +231,7 @@ def progressScore(start, goal, state_history):
     r_near = 1.0 / (dist_now ** (2 / np.e) + 1.0)
 
     return float(r_progress + r_near)
+
 
 def stabilityScore(state):
     roll, pitch = state[7], state[8]
@@ -277,15 +247,15 @@ def stabilityScore(state):
         else np.exp(-1.5 * (tilt_mag - x1)) - 0.04
     )
 
-    # PD-style stabilization penalty
     attitude_penalty = (
-        (0.3 * pitch + pitch_rate)**2 +
-        (0.3 * roll  + roll_rate )**2
+        (0.3 * pitch + pitch_rate) ** 2
+        + (0.3 * roll + roll_rate) ** 2
     )
 
     score = r_tilt - 0.0 * attitude_penalty
 
-    return np.clip(score, 0, 1)
+    return float(np.clip(score, 0, 1))
+
 
 def z_score(end, current):
     target_z = end[2]
@@ -301,6 +271,7 @@ def z_score(end, current):
         return float(np.exp(-0.5 * (bottom_z - cur_z)))
 
     return 1.0
+
 
 def vibrationScore_jitter(history):
     if history is None or len(history) < 3:
@@ -321,7 +292,6 @@ def vibrationScore_jitter(history):
 
         jitter += np.linalg.norm(curr_vec - prev_vec)
 
-        # Maximum possible difference between the two vectors
         max_jitter += np.linalg.norm(prev_vec) + np.linalg.norm(curr_vec)
 
     if max_jitter <= 1e-8:
@@ -330,7 +300,8 @@ def vibrationScore_jitter(history):
     score = 1 - jitter / max_jitter
 
     return float(np.clip(score, 0.0, 1.0))
-    
+
+
 def vibrationScore_len(history):
     if history is None or len(history) < 3:
         return 1.0
@@ -348,30 +319,41 @@ def vibrationScore_len(history):
 
     return float(np.clip(score, 0.0, 1.0))
 
+
 def outputVibrationScore(state_history):
-    # print(state_history)
     return vibrationScore_jitter(state_history[:, 16:20])
+
 
 def velocityVibrationScore(state_history):
     return vibrationScore_jitter(state_history[:, 10:13])
 
+
 def quaternionHistoryScore(state_history):
     return vibrationScore_jitter(state_history[:, 3:7])
+
 
 def positionVibrationScore(state_history):
     return vibrationScore_len(state_history[:, 0:3])
 
+
 # Position            : state[0:3]
 # Orientation (quat)  : state[3:7]
-# Orientation (roll, pitch, yaw)  : state[7:10]
+# Orientation RPY     : state[7:10]
 # Linear Velocity     : state[10:13]
 # Angular Velocity    : state[13:16]
 # last_clipped_action : state[16:20]
 
+
 def r_sum(items):
-    # Each entry: (name, weight, reward_value, color, linestyle, linewidth)
+    # Each entry:
+    # (name, weight, reward_value, color, linestyle, linewidth, orderUpDependencies)
     weight_sum = sum(item[1] for item in items)
+
+    if weight_sum <= 1e-8:
+        return 0.0, {}
+
     result = {}
+
     for name, w, val, color, linestyle, lw, orderUpDependencies in items:
         result[name] = {
             "v": (w * val) / weight_sum,
@@ -382,18 +364,159 @@ def r_sum(items):
             "linestyle": linestyle,
             "linewidth": lw,
         }
+
+    # Old dependency logic kept as commented reference.
     # for name, w, val, color, linestyle, lw, orderUpDependencies in items:
     #     for dependency in orderUpDependencies:
     #         rate = np.maximum(1.0, result[name]["v"] / result[dependency]["v"])
     #         result[name]["v"] = result[name]["v"] * rate
     #         result[name]["value"] = result[name]["value"] * rate
+
     return sum(r["v"] for r in result.values()), result
 
+
 def r_mult(items):
-    res = 1;
+    res = 1
     for item in items:
         res *= item[0] * item[1]
     return res
+
+
+# ---------------------------------------------------------------------
+# New pretraining helper functions
+# ---------------------------------------------------------------------
+
+
+def history_velocity(
+    state_history,
+    frames: int = HISTORY_VEL_FRAMES,
+    hz: float = MAX_HZ,
+):
+    """Estimate velocity from state_history positions.
+
+    Important:
+    This does NOT use state[10:13].
+    """
+    if state_history is None:
+        return np.zeros(3, dtype=np.float64)
+
+    history = np.asarray(state_history, dtype=np.float64)
+
+    if history.ndim != 2 or history.shape[0] < 2:
+        return np.zeros(3, dtype=np.float64)
+
+    frames = min(frames, history.shape[0] - 1)
+
+    if frames <= 0:
+        return np.zeros(3, dtype=np.float64)
+
+    pos_now = history[-1, 0:3]
+    pos_prev = history[-1 - frames, 0:3]
+
+    measured_velocity = (pos_now - pos_prev) * (hz / frames)
+
+    if not np.all(np.isfinite(measured_velocity)):
+        return np.zeros(3, dtype=np.float64)
+
+    return measured_velocity
+
+
+def yaw_forward_xy(yaw: float):
+    return np.array([np.cos(yaw), np.sin(yaw)], dtype=np.float64)
+
+
+def yaw_to_goal_score(current, goal, yaw):
+    current = np.asarray(current, dtype=np.float64)
+    goal = np.asarray(goal, dtype=np.float64)
+
+    direction_xy = goal[0:2] - current[0:2]
+
+    if np.linalg.norm(direction_xy) < MOVEMENT_EPS:
+        return 1.0
+
+    return forwardDirectionReward(current, goal, yaw)
+
+
+def moving_forward_score(measured_velocity, yaw):
+    """Reward movement direction matching yaw direction.
+
+    Uses measured_velocity from history.
+    """
+    vel_xy = np.asarray(measured_velocity[0:2], dtype=np.float64)
+    speed_xy = np.linalg.norm(vel_xy)
+
+    if speed_xy < MOVEMENT_EPS:
+        return 0.0
+
+    vel_dir = vel_xy / speed_xy
+    forward_dir = yaw_forward_xy(yaw)
+
+    alignment = np.dot(vel_dir, forward_dir)
+
+    return float(np.clip(alignment, 0.0, 1.0))
+
+
+def active_speed_score(measured_velocity):
+    """Reward active horizontal movement."""
+    speed_xy = np.linalg.norm(measured_velocity[0:2])
+
+    return float(np.clip(speed_xy / ACTIVE_SPEED_FULL, 0.0, 1.0))
+
+
+def speed_to_forward_score(measured_velocity, yaw):
+    """Reward speed in the drone's forward direction.
+
+    Uses measured_velocity from history.
+    Full score at ACTIVE_SPEED_FULL forward speed.
+    """
+    vel_xy = np.asarray(measured_velocity[0:2], dtype=np.float64)
+    forward_dir = yaw_forward_xy(yaw)
+
+    forward_speed = np.dot(vel_xy, forward_dir)
+
+    return float(np.clip(forward_speed / ACTIVE_SPEED_FULL, 0.0, 1.0))
+
+
+def small_z_change_score(measured_velocity):
+    """Reward small vertical speed."""
+    z_speed = abs(float(measured_velocity[2]))
+
+    return float(np.clip(1.0 - z_speed / MAX_Z_SPEED_SMALL_CHANGE, 0.0, 1.0))
+
+
+def pretraining_safe_score(state, min_clearance=None):
+    """Safety score for pretraining."""
+    attitude_safe = float(stabilityScore(state))
+
+    if min_clearance is None:
+        return attitude_safe
+
+    clearance_safe = _calculate_safety_term(
+        min_clearance=min_clearance,
+        collision=False,
+    )
+
+    return float(min(attitude_safe, clearance_safe))
+
+
+def add_debug_row(
+    result,
+    name,
+    value,
+    color="gray",
+    linestyle="dashed",
+    linewidth=1.0,
+):
+    result[name] = {
+        "v": float(value),
+        "value": float(value),
+        "label": name,
+        "weight": 0.0,
+        "color": color,
+        "linestyle": linestyle,
+        "linewidth": linewidth,
+    }
+
 
 def flight_reward(
     success: bool,
@@ -414,11 +537,13 @@ def flight_reward(
     if collision:
         return 0.0, {}
 
-    if success:
-        if state is None:
-            return 1.0, {}
+    measured_velocity = history_velocity(state_history)
 
-        speed = np.linalg.norm(state[10:13])
+    if success:
+        # Important:
+        # Do not use state[10:13] here.
+        # Stop score also uses history-measured velocity.
+        speed = np.linalg.norm(measured_velocity)
         stop_score = 1.0 - np.clip(speed / MAX_SPEED, 0.0, 1.0)
 
         reward = 0.5 + 0.5 * stop_score
@@ -449,182 +574,248 @@ def flight_reward(
                 "linewidth": 4.0,
             },
         }
-            
 
+    if state is None or state_history is None or task is None:
+        return 0.0, {}
 
-    if(state is None or state_history is None):
+    state_history = np.asarray(state_history, dtype=np.float64)
+
+    if state_history.ndim != 2 or state_history.shape[0] < 2:
         return 0.0, {}
 
     currentPos = state[0:3]
-    currentVel = state[10:13]
-    currentAngVel = state[13:16]
-    currentRoll = state[7]
-    currentPitch = state[8]
     currentYaw = state[9]
-    currentQuat = state[3:7]
-    
+
     startPos = np.array(task.start)
-    # endPos = np.array([task.goal[0], task.goal[1],task.goal[2] + 5])
     endPos = np.array(task.goal)
-    
-    disSE = np.linalg.norm(endPos - startPos)
-    disCE = np.linalg.norm(endPos - currentPos)
 
-    velocity = 0.0
-    S = MAX_SPEED
-    frames = 10
-    if state_history.shape[0] > frames:
-        displacement = np.linalg.norm(
-            state_history[-1, 0:3] - state_history[-1 - frames, 0:3]
-        )
-
-        velocity = (displacement / frames) * MAX_HZ
-
-    # if(t < 10):
-    #     print(currentPos[2] , startPos[2], currentPos[2] - startPos[2])
-
-    r_success = 1.0 if success else 0.0
-    r_safe = stabilityScore(state)
-    r_z = z_score(endPos, currentPos)
-    # r_distance = disScore(startPos, endPos, currentPos)
-    # reward = reward * np.exp((- disCE / disSE))
-    r_distance = np.exp(2 * (- disCE / disSE))
-    r_forward = forwardScore(endPos, currentPos, currentVel)
-    r_forward_direction = forwardDirectionReward(currentPos, endPos, currentYaw)
+    # ------------------------------------------------------------------
+    # OLD LOGIC KEPT AS COMMENTED REFERENCE
+    # ------------------------------------------------------------------
+    # currentVel = state[10:13]
+    # currentAngVel = state[13:16]
+    # currentRoll = state[7]
+    # currentPitch = state[8]
+    # currentQuat = state[3:7]
+    #
+    # disSE = np.linalg.norm(endPos - startPos)
+    # disCE = np.linalg.norm(endPos - currentPos)
+    #
+    # velocity = 0.0
+    # S = MAX_SPEED
+    # frames = 10
+    # if state_history.shape[0] > frames:
+    #     displacement = np.linalg.norm(
+    #         state_history[-1, 0:3] - state_history[-1 - frames, 0:3]
+    #     )
+    #
+    #     velocity = (displacement / frames) * MAX_HZ
+    #
+    # r_success = 1.0 if success else 0.0
+    # r_safe = stabilityScore(state)
+    # r_z = z_score(endPos, currentPos)
+    # r_distance = np.exp(2 * (- disCE / disSE))
+    # r_forward = forwardScore(endPos, currentPos, currentVel)
+    # r_forward_direction = forwardDirectionReward(currentPos, endPos, currentYaw)
     # raw_progress = progressScore(startPos, endPos, state_history)
     # r_progress = float(np.tanh(max(0.0, raw_progress)))
-    r_time = np.clip(
-        1 - (t / MAX_FRAMES),
-        # 1 - (t / _calculate_target_time(task)),
-        0.0,
-        1.0
+    # r_time = np.clip(
+    #     1 - (t / MAX_FRAMES),
+    #     0.0,
+    #     1.0
+    # )
+    #
+    # short_state_history = state_history[-60:]
+    # r_quaternionHistoryScore = quaternionHistoryScore(short_state_history)
+    # r_velocityVibration = velocityVibrationScore(short_state_history)
+    # r_positionVibration = positionVibrationScore(short_state_history)
+    #
+    # forward_dir = np.array([np.cos(currentYaw), np.sin(currentYaw), 0.0])
+    # r_forward_velocity = scaled_tanh(np.dot(forward_dir, currentVel), 0, 1)
+    #
+    # speed = np.linalg.norm(currentVel)
+    #
+    # target_speed = np.clip(disCE / DECEL_RADIUS, 0.0, 1.0) * MAX_SPEED
+    #
+    # r_final_speed = 1.0 - np.clip(
+    #     abs(speed - target_speed) / MAX_SPEED,
+    #     0.0,
+    #     1.0
+    # )
+    #
+    # reward, result = r_sum([
+    #     ("distance", 1.0, r_distance, "brown", "solid", 1.0, []),
+    #     ("progress", 0.3, r_progress, "red", "solid", 1.0, ["z"]),
+    #     ("forward_direction", 0.3, r_forward_direction, "brown", "solid", 3.0, []),
+    #     ("forward", 0.2, r_forward, "blue", "solid", 2.0, ["progress", "z"]),
+    #     ("final_speed", 0.25, r_final_speed, "purple", "dotted", 2.0, []),
+    #     ("stability", 0.10, r_safe, "green", "dotted", 1.0, [
+    #         "forward",
+    #         "progress",
+    #         "z",
+    #         "vibration_quat",
+    #         "vibration_pos",
+    #         "forward_velocity",
+    #         "final_speed",
+    #     ]),
+    #     ("z", 0.05, r_z, "purple", "solid", 1.0, []),
+    #     ("vibration_quat", 0.08, r_quaternionHistoryScore, "orange", "dotted", 1.0, []),
+    #     ("vibration_pos", 0.08, r_positionVibration, "gray", "dashed", 1.0, []),
+    #     ("time", 0.05, r_time, "pink", "solid", 1.0, []),
+    # ])
+    #
+    # result["total"] = {
+    #     "value": float(reward),
+    #     "v": float(reward),
+    #     "weight": 0.0,
+    #     "color": "orange",
+    #     "linestyle": "solid",
+    #     "linewidth": 4.0,
+    # }
+    #
+    # R, Z = 0.5, 0.01
+    # dis_xy = np.linalg.norm(currentPos[0:2] - startPos[0:2])
+    #
+    # if dis_xy < R and currentPos[2] < state_history[0][2] + 0.2:
+    #     if currentPos[2] < state_history[0][2] + t * 0.1:
+    #         spin_print("[bad] take off", state_history[0][2] - currentPos[2], t)
+    #         reward = 0
+    #
+    # result["success"] = {
+    #     "v": float(r_success),
+    #     "weight": 0.0,
+    #     "color": "black",
+    #     "linestyle": "solid",
+    #     "linewidth": 0.5,
+    # }
+    #
+    # result["SPEED"] = {
+    #     "v": result["total"]["value"],
+    #     "value": reward,
+    #     "weight": 0.0,
+    #     "color": "orange",
+    #     "linestyle": "solid",
+    #     "linewidth": 5.0,
+    # }
+    #
+    # result["total"]["v"] = float(reward)
+    # return reward, result
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # NEW ACTIVE PRETRAINING LOGIC
+    #
+    # Important:
+    # - state[10:13] is NOT used.
+    # - Velocity is measured from state_history.
+    #
+    # Reward components:
+    # - speed_to_forward:
+    #     actual measured speed projected onto yaw-forward direction
+    #
+    # - active_movement:
+    #     yaw faces goal
+    #     movement direction follows yaw
+    #     horizontal movement is active
+    #     z movement is small
+    #     attitude / clearance is safe
+    # ------------------------------------------------------------------
+
+    r_success = 0.0
+
+    r_speed_to_forward = speed_to_forward_score(
+        measured_velocity=measured_velocity,
+        yaw=currentYaw,
     )
-    
-    short_state_history = state_history[-60:]
-    # r_outputVibration = outputVibrationScore(short_state_history)
-    r_quaternionHistoryScore = quaternionHistoryScore(short_state_history)
-    r_velocityVibration = velocityVibrationScore(short_state_history)
-    r_positionVibration = positionVibrationScore(short_state_history)
 
-    forward_dir = np.array([np.cos(currentYaw), np.sin(currentYaw), 0.0])
-    r_forward_velocity = scaled_tanh(np.dot(forward_dir, currentVel), 0, 1)
-    
-    # final speed
-    speed = np.linalg.norm(currentVel)
+    r_yaw_to_goal = yaw_to_goal_score(
+        current=currentPos,
+        goal=endPos,
+        yaw=currentYaw,
+    )
 
-    target_speed = np.clip(disCE / DECEL_RADIUS, 0.0, 1.0) * MAX_SPEED
+    r_moving_forward = moving_forward_score(
+        measured_velocity=measured_velocity,
+        yaw=currentYaw,
+    )
 
-    r_final_speed = 1.0 - np.clip(
-        abs(speed - target_speed) / MAX_SPEED,
-        0.0,
-        1.0
+    r_active_speed = active_speed_score(
+        measured_velocity=measured_velocity,
+    )
+
+    r_small_z_change = small_z_change_score(
+        measured_velocity=measured_velocity,
+    )
+
+    r_safe = pretraining_safe_score(
+        state=state,
+        min_clearance=min_clearance,
+    )
+
+    r_active_movement = (
+        0.25 * r_yaw_to_goal
+        + 0.25 * r_moving_forward
+        + 0.20 * r_active_speed
+        + 0.15 * r_small_z_change
+        + 0.15 * r_safe
     )
 
     reward, result = r_sum([
-        # ("forward & stability", 0.7, r_forward * r_safe, "blue", "solid", 1.0),
-        ("distance", 1, r_distance, "brown", "solid", 1.0, []),
-        ("forward_direction", 0.4, r_forward_direction, "brown", "solid", 3.0, []),
-        # ("forward", 0.3, r_forward, "blue", "solid", 2.0,  ["progress", "z"]),
-        ("final_speed", 0.25, r_final_speed, "purple", "dotted", 2.0, []),
-        ("stability", 0.10, r_safe, "green", "dotted", 1.0, ["forward", "progress", "z", "vibration_quat", "vibration_pos", "forward_velocity", "final_speed"]),
-        # ("progress", 0.70, r_progress, "red", "solid", 1.0, ["z"]),
-        ("z", 0.05, r_z, "purple", "solid", 1.0, []),
-        ("vibration_quat", 0.08, r_quaternionHistoryScore, "orange", "dotted", 1.0, []),
-        ("vibration_pos", 0.08, r_positionVibration, "gray", "dashed", 1.0, []),
-        ("forward_velocity", 0.10, r_forward_velocity, "gray", "dashed", 2.0, []),
-        # ("vibration_output", 0.3, r_outputVibration, "purple", "dashed", 1.0),
-        # ("vibration_vel", 0.1, r_velocityVibration, "orange", "dashed", 1.0),
-        ("time", 0.05, r_time, "pink", "solid", 1.0, []),
+        ("speed_to_forward", 0.55, r_speed_to_forward, "blue", "solid", 2.0, []),
+        ("active_movement", 0.45, r_active_movement, "green", "solid", 2.0, []),
     ])
-    
-    # reward, result = r_sum([
-    #     # ("forward & stability", 0.7, r_forward * r_safe, "blue", "solid", 1.0),
-    #     ("distance",1, r_distance, "brown", "solid", 1.0),
-    #     ("stability", 0.3, r_safe, "green", "dotted", 1.0, ["forward", "progress", "z", "vibration_quat", "vibration_pos", "forward_velocity", "final_speed"]),
-    #     ("forward", 0.2, r_forward, "blue", "solid", 1.0, ["progress", "z"]),
-    #     ("progress", 0.2, r_progress, "red", "solid", 1.0, ["z"]),
-    #     ("z", 0.2, r_z, "purple", "solid", 1.0),
-    #     ("vibration_quat", 0.1, r_quaternionHistoryScore, "orange", "dotted", 1.0),
-    #     ("vibration_pos", 0.1, r_positionVibration, "gray", "dashed", 1.0),
-    #     ("forward_velocity", 0.08, r_forward_velocity, "gray", "dashed", 2.0),
-    #     ("final_speed", 0.3, r_final_speed, "yellow", "dotted", 2.0),
-    #     ("time", 0.1, r_time, "pink", "solid", 1.0),
-    #     # ("vibration_output", 0.3, r_outputVibration, "purple", "dashed", 1.0),
-    #     # ("vibration_vel", 0.1, r_velocityVibration, "orange", "dashed", 1.0),
-    # ])
-    
-    result["total"] = {
-        "value": float(reward),
-        "v": float(reward),
-        "weight": 0.0,
-        "color": "orange",
-        "linestyle": "solid",
-        "linewidth": 4.0,
-    }
-    # Extra rows for downstream logging / Qt monitor (same shape as r_sum rows)
-    
-    # landing
+
+    add_debug_row(result, "yaw_to_goal", r_yaw_to_goal, "brown", "solid", 2.0)
+    add_debug_row(result, "moving_forward", r_moving_forward, "purple", "solid", 2.0)
+    add_debug_row(result, "active_speed", r_active_speed, "red", "solid", 1.5)
+    add_debug_row(result, "small_z_change", r_small_z_change, "pink", "solid", 1.5)
+    add_debug_row(result, "safe", r_safe, "orange", "dotted", 1.5)
+
+    measured_speed = np.linalg.norm(measured_velocity)
+    measured_speed_xy = np.linalg.norm(measured_velocity[0:2])
+
+    add_debug_row(result, "measured_speed", measured_speed, "gray", "dashed", 1.0)
+    add_debug_row(result, "measured_speed_xy", measured_speed_xy, "gray", "dashed", 1.0)
+    add_debug_row(result, "measured_vx", measured_velocity[0], "gray", "dashed", 1.0)
+    add_debug_row(result, "measured_vy", measured_velocity[1], "gray", "dashed", 1.0)
+    add_debug_row(result, "measured_vz", measured_velocity[2], "gray", "dashed", 1.0)
+
+    # Keep old takeoff guard.
     R, Z = 0.5, 0.01
     dis_xy = np.linalg.norm(currentPos[0:2] - startPos[0:2])
 
     if dis_xy < R and currentPos[2] < state_history[0][2] + 0.2:
         if currentPos[2] < state_history[0][2] + t * 0.1:
-            spin_print("[bad] take off", state_history[0][2] - currentPos[2], t )
-            reward = 0
+            spin_print("[bad] take off", state_history[0][2] - currentPos[2], t)
+            reward = 0.0
 
-    # land going
+    reward = float(_clamp(reward, 0.0, 1.0))
 
-    # print(reward)
-    # result["total"]["value"] = float(reward)
-
-    # if state_history.shape[0] > 0:
-    #     if currentPos[2] < np.minimum(0.27, state_history[0][2]):
-    #         reward *= 0.1
-    #         spin_print("[bad] land going", currentPos[2])
-
-    # obstacle clearance
-    # if min_clearance is not None:
-    #     SS = 1
-    #     SE = 0.5
-    #     if min_clearance < SS:
-    #         reward *= _clamp((1 - (SS - min_clearance) / (SS - SE)), 0,1)
-    #         spin_print("[bad] collide", min_clearance)
-
-    # schedule_deadline_fail = False
-    # AA = (disCE / disSE) if disSE > 1e-8 else 0.0
-    # BB = (1 - t / 60)
-    # if AA > BB:
-    #     RR = 1.0 - (AA - BB) * 10.0
-    #     if RR < 0.0:
-    #         # Too far vs. time budget: zero shaping reward and signal env to reset episode.
-    #         schedule_deadline_fail = True
-    #         reward = 0.0
-    #         spin_print("[bad] die truncate", AA, BB, RR)
-    #     else:
-    #         reward *= RR
-    #         spin_print("[bad] die", AA, BB)
-    # result["schedule_deadline_fail"] = schedule_deadline_fail
-
-    # #distance to goal
-    # reward = reward * np.exp((- disCE / disSE))
+    result["total"] = {
+        "value": reward,
+        "v": reward,
+        "weight": 0.0,
+        "color": "orange",
+        "linestyle": "solid",
+        "linewidth": 4.0,
+    }
 
     result["success"] = {
         "v": float(r_success),
+        "value": float(r_success),
         "weight": 0.0,
         "color": "black",
         "linestyle": "solid",
         "linewidth": 0.5,
     }
-    # print(velocity, currentVel)
 
     result["SPEED"] = {
-        "v": result["total"]["value"],
+        "v": reward,
         "value": reward,
         "weight": 0.0,
         "color": "orange",
         "linestyle": "solid",
         "linewidth": 5.0,
     }
-    
-    result["total"]["v"] = float(reward)
+
     return reward, result
